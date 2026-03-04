@@ -1,0 +1,11 @@
+[
+  {
+    "name": "example-server",
+    "host": "example.com",
+    "port": 22,
+    "username": "user",
+    "auth_type": "password",
+    "password": "your-password-here",
+    "description": "Пример профиля для SSH-подключения"
+  }
+]
