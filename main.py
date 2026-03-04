@@ -142,7 +142,11 @@ def add_profile(profiles: List[Dict[str, Any]]) -> None:
     host = input("Host (IP/домен): ").strip()
     port_str = input("Порт [22]: ").strip() or "22"
     username = input("Имя пользователя: ").strip()
-    auth_type = input("Тип аутентификации [password/ssh_key] (по умолчанию password): ").strip() or "password"
+    console.print("Тип аутентификации:")
+    console.print("  [b][1][/b] Пароль")
+    console.print("  [b][2][/b] SSH-ключ")
+    auth_choice = IntPrompt.ask("Ваш выбор", choices=["1", "2"], default=1)
+    auth_type = "password" if auth_choice == 1 else "ssh_key"
 
     try:
         port = int(port_str)
