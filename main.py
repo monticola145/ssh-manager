@@ -90,10 +90,31 @@ def add_profile(profiles: List[Dict[str, Any]]) -> None:
         profile["password"] = input("Пароль (будет сохранён в profiles.json): ")
     else:
         profile["key_path"] = input("Путь к приватному ключу (например, ~/.ssh/id_rsa): ").strip()
+        passphrase = input("Passphrase для ключа (оставьте пустым, если ключ не защищён): ").strip()
+        if passphrase:
+            profile["key_passphrase"] = passphrase
 
     profiles.append(profile)
     save_profiles(profiles)
     console.print("[green]Профиль сохранён.[/green]")
+
+
+def _load_private_key(key_path: str, passphrase: str | None = None) -> paramiko.PKey | None:
+    """Загружает приватный ключ (RSA, Ed25519, ECDSA), при необходимости с passphrase."""
+    key_path = os.path.expanduser(key_path)
+    if not os.path.exists(key_path):
+        return None
+    for key_class in (paramiko.RSAKey, paramiko.Ed25519Key, paramiko.ECDSAKey):
+        try:
+            return key_class.from_private_key_file(key_path, password=passphrase or None)
+        except paramiko.ssh_exception.SSHException as e:
+            err = str(e).lower()
+            if "encrypted" in err or "passphrase" in err:
+                raise
+            continue
+        except Exception:
+            continue
+    return None
 
 
 def connect_via_ssh(profile: Dict[str, Any]) -> None:
@@ -116,10 +137,18 @@ def connect_via_ssh(profile: Dict[str, Any]) -> None:
         if not os.path.exists(key_path):
             console.print(f"[red]Ключ не найден: {key_path}[/red]")
             return
+        key_passphrase = profile.get("key_passphrase") or None
         try:
-            pkey = paramiko.RSAKey.from_private_key_file(key_path)
-        except Exception as e:
-            console.print(f"[red]Ошибка чтения ключа: {e}[/red]")
+            pkey = _load_private_key(key_path, key_passphrase)
+        except paramiko.ssh_exception.SSHException as e:
+            if "encrypted" in str(e).lower() or "passphrase" in str(e).lower():
+                key_passphrase = input("Введите passphrase для ключа: ")
+                pkey = _load_private_key(key_path, key_passphrase or None)
+            else:
+                console.print(f"[red]Ошибка чтения ключа: {e}[/red]")
+                return
+        if pkey is None:
+            console.print("[red]Не удалось прочитать ключ (поддерживаются RSA, Ed25519, ECDSA).[/red]")
             return
 
     client = paramiko.SSHClient()
