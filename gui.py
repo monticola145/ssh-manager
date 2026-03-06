@@ -4,20 +4,144 @@
 """
 import json
 import os
+import queue
 import re
 import sys
 import threading
 import time
 from typing import Any, Callable
 
-# Убираем ANSI-коды из вывода SSH (цвета, курсив и т.д.), чтобы текст не "плыл"
-_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x1b[PX^_]")
+# ANSI SGR → имя тега для подсветки (тёмная тема)
+_ANSI_FG_TAGS = {
+    30: "ansi_black",
+    31: "ansi_red",
+    32: "ansi_green",
+    33: "ansi_yellow",
+    34: "ansi_blue",
+    35: "ansi_magenta",
+    36: "ansi_cyan",
+    37: "ansi_white",
+    90: "ansi_bright_black",
+    91: "ansi_bright_red",
+    92: "ansi_bright_green",
+    93: "ansi_bright_yellow",
+    94: "ansi_bright_blue",
+    95: "ansi_bright_magenta",
+    96: "ansi_bright_cyan",
+    97: "ansi_bright_white",
+}
 
-def _strip_ansi(text: str) -> str:
-    return _ANSI_ESCAPE.sub("", text)
+def _parse_ansi(chunk: str) -> list[tuple[str, str]]:
+    """Разбирает строку с ANSI-кодами, возвращает список (текст, имя_тега)."""
+    out: list[tuple[str, str]] = []
+    current = "default"
+    i = 0
+    while i < len(chunk):
+        if chunk[i : i + 1] == "\x1b" and i + 1 < len(chunk):
+            if chunk[i + 1] == "[":
+                j = i + 2
+                while j < len(chunk) and chunk[j] not in "ABCDEFGHJKRm":
+                    j += 1
+                if j < len(chunk) and chunk[j] == "m":
+                    codes = chunk[i + 2 : j]
+                    for part in codes.split(";"):
+                        try:
+                            n = int(part.strip())
+                            if n == 0 or n == 39:
+                                current = "default"
+                            elif n in _ANSI_FG_TAGS:
+                                current = _ANSI_FG_TAGS[n]
+                        except ValueError:
+                            pass
+                i = j + 1
+                continue
+            if chunk[i + 1] == "]":
+                j = chunk.find("\x07", i + 2)
+                if j != -1:
+                    i = j + 1
+                    continue
+        # обычный текст до следующего ESC
+        end = chunk.find("\x1b", i)
+        if end == -1:
+            end = len(chunk)
+        if end > i:
+            out.append((chunk[i:end], current))
+        i = end
+    return out
+
+
+def _key_event_to_bytes(event: Any) -> bytes:
+    """Преобразует событие клавиши Tk в байты для отправки в PTY (nano, vim)."""
+    char = getattr(event, "char", "") or ""
+    keysym = getattr(event, "keysym", "")
+    state = getattr(event, "state", 0)
+    # Один символ (в т.ч. управляющий при Ctrl+буква)
+    if len(char) == 1:
+        o = ord(char)
+        if o < 32 or o == 127:
+            return bytes([o])
+        return char.encode("utf-8")
+    # Специальные клавиши
+    key_to_bytes: dict[str, bytes] = {
+        "Return": b"\r",
+        "KP_Enter": b"\r",
+        "BackSpace": b"\x7f",
+        "Tab": b"\t",
+        "Left": b"\x1b[D",
+        "Right": b"\x1b[C",
+        "Up": b"\x1b[A",
+        "Down": b"\x1b[B",
+        "Home": b"\x1b[H",
+        "End": b"\x1b[F",
+        "Delete": b"\x1b[3~",
+    }
+    if keysym in key_to_bytes:
+        return key_to_bytes[keysym]
+    # Ctrl+символ по keysym (когда char пустой)
+    if state & 0x4 and keysym:
+        if len(keysym) == 1 and "a" <= keysym <= "z":
+            return bytes([ord(keysym.upper()) - 64])
+        if len(keysym) == 1 and "A" <= keysym <= "Z":
+            return bytes([ord(keysym) - 64])
+        if keysym in ("slash", "question"):
+            return b"\x1f"  # Ctrl+/
+        if keysym == "bracketleft":
+            return b"\x1b"  # Ctrl+[
+        if keysym == "backslash":
+            return b"\x1c"  # Ctrl+\
+    return b""
+
 
 import customtkinter as ctk
 import paramiko
+
+try:
+    import pyte
+    from wcwidth import wcwidth
+except ImportError:
+    pyte = None  # pip install pyte
+    wcwidth = None
+
+# Цвета pyte (имена fg/bg) → hex для тёмной темы терминала
+_PYTE_COLORS: dict[str, str] = {
+    "default": "#abb2bf",
+    "black": "#5c6370",
+    "red": "#e06c75",
+    "green": "#98c379",
+    "brown": "#e5c07b",
+    "blue": "#61afef",
+    "magenta": "#c678dd",
+    "cyan": "#56b6c2",
+    "white": "#abb2bf",
+    "brightblack": "#4b5263",
+    "brightred": "#e06c75",
+    "brightgreen": "#98c379",
+    "brightbrown": "#e5c07b",
+    "brightblue": "#61afef",
+    "brightmagenta": "#c678dd",
+    "brightcyan": "#56b6c2",
+    "brightwhite": "#c8ccd4",
+}
 
 # Путь к данным (как в main.py)
 if getattr(sys, "frozen", False):
@@ -26,6 +150,7 @@ else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 PROFILES_FILE = os.path.join(_BASE_DIR, "profiles.json")
+NOTES_FILE = os.path.join(_BASE_DIR, "notes.txt")
 
 
 def load_profiles() -> list[dict[str, Any]]:
@@ -42,6 +167,24 @@ def load_profiles() -> list[dict[str, Any]]:
 def save_profiles(profiles: list[dict[str, Any]]) -> None:
     with open(PROFILES_FILE, "w", encoding="utf-8") as f:
         json.dump(profiles, f, ensure_ascii=False, indent=2)
+
+
+def load_notes() -> str:
+    if not os.path.exists(NOTES_FILE):
+        return ""
+    try:
+        with open(NOTES_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def save_notes(text: str) -> None:
+    try:
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        pass
 
 
 def _load_private_key(key_path: str, passphrase: str | None = None) -> paramiko.PKey | None:
@@ -109,13 +252,44 @@ def connect_ssh(
         client.close()
         return None
 
-    channel = client.invoke_shell()
+    channel = client.invoke_shell(term="xterm", width=80, height=24)
     channel.settimeout(0.0)
     return (client, channel)
 
 
+def _setup_pyte_tags(textbox: Any) -> None:
+    """Настраивает теги виджета текста под цвета pyte (тёмная тема)."""
+    for name, hex_color in _PYTE_COLORS.items():
+        tag = "pyte_" + name
+        textbox.tag_configure(tag, foreground=hex_color)
+
+
+def _screen_to_segments(screen: Any) -> list[tuple[str, str]]:
+    """Собирает из буфера pyte Screen список пар (текст, имя_тега) с учётом wide-символов."""
+    segments: list[tuple[str, str]] = []
+    cols, lines = screen.columns, screen.lines
+    for y in range(lines):
+        row = screen.buffer[y]
+        is_wide = False
+        for x in range(cols):
+            if is_wide:
+                is_wide = False
+                continue
+            ch = row[x]
+            data = ch.data
+            fg = ch.bg if ch.reverse else ch.fg
+            tag = "pyte_" + (fg if fg in _PYTE_COLORS else "default")
+            if wcwidth is not None and data:
+                if wcwidth(data[0]) == 2:
+                    is_wide = True
+            segments.append((data, tag))
+        if y < lines - 1:
+            segments.append(("\n", "pyte_default"))
+    return segments
+
+
 class SessionView(ctk.CTkFrame):
-    """Виджет SSH-сессии (вывод + поле ввода) для встраивания в основное окно."""
+    """Виджет SSH-сессии (встроенный терминал на pyte) для встраивания в основное окно."""
 
     def __init__(
         self,
@@ -127,6 +301,9 @@ class SessionView(ctk.CTkFrame):
         **kwargs: Any,
     ) -> None:
         super().__init__(parent, fg_color="transparent", **kwargs)
+        if pyte is None:
+            raise ImportError("Для встроенного терминала нужен pyte. Выполните: pip install pyte")
+
         self.profile = profile
         self.client = client
         self.channel = channel
@@ -136,25 +313,66 @@ class SessionView(ctk.CTkFrame):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.text = ctk.CTkTextbox(self, font=ctk.CTkFont(family="Consolas", size=13), wrap="word")
-        self.text.grid(row=0, column=0, sticky="nsew", padx=8, pady=(8, 4))
+        self._term_cols, self._term_rows = 80, 24
+        self._screen = pyte.Screen(self._term_cols, self._term_rows)
+        self._stream = pyte.ByteStream(self._screen)
 
-        self.entry = ctk.CTkEntry(self, placeholder_text="Введите команду...")
-        self.entry.grid(row=1, column=0, sticky="ew", padx=8, pady=(0, 8))
-        self.entry.bind("<Return>", self._on_send)
+        self.text = ctk.CTkTextbox(
+            self,
+            font=ctk.CTkFont(family="Consolas", size=13),
+            wrap="none",
+        )
+        self.text.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+        _setup_pyte_tags(self.text._textbox)
+
+        self.text.bind("<Control-c>", self._on_ctrl_c)
+        self.text._textbox.bind("<KeyPress>", self._on_terminal_key)
+
+        self._output_queue: queue.Queue[bytes] = queue.Queue()
+        self._output_schedule_id: str | None = None
+        self._flush_interval_ms = 40
+
+        self._send_queue: queue.Queue[bytes] = queue.Queue()
+        self._sender_thread = threading.Thread(target=self._send_loop, daemon=True)
+        self._sender_thread.start()
 
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
+        self.after(self._flush_interval_ms, self._poll_pending_output)
 
-    def _on_send(self, event: Any = None) -> None:
-        line = self.entry.get().strip() + "\n"
-        self.entry.delete(0, "end")
+    def _on_ctrl_c(self, event: Any = None) -> str:
+        if self.running:
+            self._send(b"\x03")
+        return "break"
+
+    def _send_loop(self) -> None:
+        while self.running:
+            try:
+                data = self._send_queue.get(timeout=0.05)
+                if not self.running:
+                    break
+                self.channel.send(data)
+            except queue.Empty:
+                continue
+            except Exception:
+                break
+
+    def _send(self, data: bytes | str) -> None:
         if not self.running:
             return
+        b = data.encode("utf-8") if isinstance(data, str) else data
         try:
-            self.channel.send(line)
-        except Exception:
-            self.running = False
+            self._send_queue.put_nowait(b)
+        except queue.Full:
+            pass
+
+    def _on_terminal_key(self, event: Any) -> str:
+        if not self.running:
+            return "break"
+        data = _key_event_to_bytes(event)
+        if data:
+            self._send(data)
+        return "break"
 
     def _read_loop(self) -> None:
         try:
@@ -164,18 +382,90 @@ class SessionView(ctk.CTkFrame):
                         data = self.channel.recv(4096)
                         if not data:
                             break
-                        text = _strip_ansi(data.decode(errors="ignore"))
-                        self.after(0, lambda t=text: self._append(t))
+                        try:
+                            self._output_queue.put_nowait(data)
+                        except queue.Full:
+                            pass
                     else:
                         time.sleep(0.02)
                 except Exception:
                     break
         finally:
-            self.after(0, self._do_close)
+            self.after(0, self._connection_lost)
 
-    def _append(self, text: str) -> None:
-        self.text.insert("end", text)
-        self.text.see("end")
+    def _connection_lost(self) -> None:
+        """Сервер закрыл соединение (exit и т.п.). Закрываем канал/клиент, вкладку не закрываем."""
+        self.running = False
+        try:
+            self.channel.close()
+        except Exception:
+            pass
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+    def disconnect(self) -> None:
+        """Отключиться по запросу пользователя (крестик на вкладке). Останавливает потоки и закрывает канал/клиент."""
+        self.running = False
+        try:
+            self.channel.close()
+        except Exception:
+            pass
+        try:
+            self.client.close()
+        except Exception:
+            pass
+
+    def _do_close(self) -> None:
+        """Полное закрытие с вызовом on_close_cb (сейчас не используется — вкладка закрывается только по крестику)."""
+        self.disconnect()
+        self.on_close_cb()
+
+    def _poll_pending_output(self) -> None:
+        if not self.running:
+            return
+        if self._output_queue.empty():
+            self._output_schedule_id = None
+            self.after(self._flush_interval_ms, self._poll_pending_output)
+            return
+        if self._output_schedule_id is not None:
+            self.after(self._flush_interval_ms, self._poll_pending_output)
+            return
+        self._output_schedule_id = "scheduled"
+        self._flush_pending_output()
+        self.after(self._flush_interval_ms, self._poll_pending_output)
+
+    def _flush_pending_output(self) -> None:
+        chunks: list[bytes] = []
+        total = 0
+        max_bytes = 65536
+        while total < max_bytes:
+            try:
+                data = self._output_queue.get_nowait()
+                chunks.append(data)
+                total += len(data)
+            except queue.Empty:
+                break
+        self._output_schedule_id = None
+        if chunks:
+            try:
+                self._stream.feed(b"".join(chunks))
+            except Exception:
+                pass
+        segments = _screen_to_segments(self._screen)
+        self.text._textbox.delete("1.0", "end")
+        for text, tag in segments:
+            self.text._textbox.insert("end", text, tag)
+        # Курсор виджета — в позиции курсора терминала (pyte), а не в конце текста
+        cy = max(0, min(self._screen.cursor.y, self._term_rows - 1))
+        cx = max(0, min(self._screen.cursor.x, self._term_cols))
+        insert_offset = cy * (self._term_cols + 1) + cx
+        self.text._textbox.mark_set("insert", f"1.0+{insert_offset}c")
+        self.text._textbox.see("insert")
+        if not self._output_queue.empty():
+            self._output_schedule_id = "scheduled"
+            self.after(self._flush_interval_ms, self._flush_pending_output)
 
     def _do_close(self) -> None:
         self.running = False
@@ -297,20 +587,32 @@ class MainApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
         self.title("SSH Manager")
-        self.geometry("820x520")
+        self._main_width = 820
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.grid_columnconfigure(0, weight=1)
+        self._main_width = 820
+        self._notepad_strip_w = 24
+        self._notepad_collapsed_w = 24
+        self._notepad_expanded_w = 416
+        self._main_right_pad = 0
+        self.grid_columnconfigure(0, weight=0, minsize=self._main_width)
+        self.grid_columnconfigure(1, weight=0)
         self.grid_rowconfigure(1, weight=1)
 
-        top = ctk.CTkFrame(self, fg_color="transparent")
+        self._left_frame = ctk.CTkFrame(self, width=self._main_width, fg_color="transparent")
+        self._left_frame.grid(row=0, column=0, rowspan=3, sticky="nsew", padx=(0, self._main_right_pad))
+        self._left_frame.grid_propagate(False)
+        self._left_frame.grid_columnconfigure(0, weight=1)
+        self._left_frame.grid_rowconfigure(1, weight=1)
+
+        top = ctk.CTkFrame(self._left_frame, fg_color="transparent")
         top.grid(row=0, column=0, sticky="ew", padx=10, pady=10)
         top.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(top, text="SSH Manager", font=ctk.CTkFont(size=22, weight="bold")).grid(row=0, column=0, sticky="w")
         ctk.CTkButton(top, text="Добавить профиль", width=140, command=self._add_profile).grid(row=0, column=1, sticky="e", padx=5)
 
-        self.content_holder = ctk.CTkFrame(self, fg_color=("gray90", "gray17"))
+        self.content_holder = ctk.CTkFrame(self._left_frame, fg_color=("gray90", "gray17"))
         self.content_holder.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 4))
         self.content_holder.grid_columnconfigure(0, weight=1)
         self.content_holder.grid_rowconfigure(0, weight=1)
@@ -319,15 +621,133 @@ class MainApp(ctk.CTk):
         self.menu_frame.grid(row=0, column=0, sticky="nsew")
         self.menu_frame.grid_columnconfigure(1, weight=1)
 
-        self.tab_bar = ctk.CTkFrame(self, fg_color=("gray85", "gray20"), height=44)
+        self._left_frame.grid_rowconfigure(2, minsize=48)
+        self.tab_bar = ctk.CTkFrame(self._left_frame, fg_color=("gray85", "gray20"), height=44)
         self.tab_bar.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        self.tab_bar.grid_propagate(False)
         self.tab_bar.grid_columnconfigure(0, weight=1)
 
         self.sessions: list[dict[str, Any]] = []
         self.current_tab: str | int = "main"
 
+        self._notepad_expanded = False
+        self._notes_save_after_id: str | None = None
+        self._right_panel = ctk.CTkFrame(self, width=self._notepad_collapsed_w, fg_color=("gray88", "gray22"))
+        self._right_panel.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(0, 6), pady=10)
+        self._right_panel.grid_propagate(False)
+        self._build_notepad_collapsed()
+        self.geometry(f"{self._main_width + self._main_right_pad + self._notepad_collapsed_w}x520")
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
         self._refresh_list()
         self._rebuild_tabs()
+
+    def _build_notepad_collapsed(self) -> None:
+        for w in self._right_panel.winfo_children():
+            w.destroy()
+        self._right_panel.configure(width=self._notepad_collapsed_w)
+        btn = ctk.CTkButton(
+            self._right_panel,
+            text="▶",
+            width=20,
+            height=60,
+            fg_color="transparent",
+            command=self._toggle_notepad,
+        )
+        btn.pack(expand=True, pady=16)
+
+    def _build_notepad_expanded(self) -> None:
+        for w in self._right_panel.winfo_children():
+            w.destroy()
+        total_w = self._notepad_strip_w + self._notepad_expanded_w
+        self._right_panel.configure(width=total_w)
+        try:
+            geom = self.geometry()
+            h = 520
+            if "+" in geom:
+                parts = geom.split("+")
+                _, h = map(int, parts[0].split("x"))
+                x, y = int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
+                self.geometry(f"{self._main_width + self._main_right_pad + total_w}x{h}+{x}+{y}")
+            else:
+                _, h = map(int, geom.split("x"))
+                self.geometry(f"{self._main_width + self._main_right_pad + total_w}x{h}")
+        except Exception:
+            self.geometry(f"{self._main_width + self._main_right_pad + total_w}x520")
+
+        strip = ctk.CTkFrame(self._right_panel, width=self._notepad_strip_w, fg_color=("gray88", "gray22"))
+        strip.pack(side="left", fill="y")
+        strip.pack_propagate(False)
+        ctk.CTkButton(
+            strip,
+            text="◀",
+            width=20,
+            height=60,
+            fg_color="transparent",
+            command=self._toggle_notepad,
+        ).pack(expand=True, pady=16)
+
+        notes_frame = ctk.CTkFrame(self._right_panel, width=self._notepad_expanded_w, fg_color="transparent")
+        notes_frame.pack(side="left", fill="y", padx=(0, 6), pady=6)
+        notes_frame.pack_propagate(False)
+        ctk.CTkLabel(notes_frame, text="Блокнот", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=4, pady=(0, 4))
+
+        self._notes_textbox = ctk.CTkTextbox(notes_frame, font=ctk.CTkFont(size=13), wrap="word")
+        self._notes_textbox.pack(fill="both", expand=True, pady=(0, 6))
+        self._notes_textbox.insert("1.0", load_notes())
+        self._notes_textbox.bind("<KeyRelease>", self._notes_schedule_save)
+
+    def _toggle_notepad(self) -> None:
+        if self._notepad_expanded:
+            self._save_notes_now()
+            self._notepad_expanded = False
+            try:
+                geom = self.geometry()
+                h = 520
+                if "+" in geom:
+                    parts = geom.split("+")
+                    _, h = map(int, parts[0].split("x"))
+                    x, y = int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
+                    self.geometry(f"{self._main_width + self._main_right_pad + self._notepad_collapsed_w}x{h}+{x}+{y}")
+                else:
+                    _, h = map(int, geom.split("x"))
+                    self.geometry(f"{self._main_width + self._main_right_pad + self._notepad_collapsed_w}x{h}")
+            except Exception:
+                self.geometry(f"{self._main_width + self._main_right_pad + self._notepad_collapsed_w}x520")
+            self._build_notepad_collapsed()
+        else:
+            self._notepad_expanded = True
+            self._build_notepad_expanded()
+
+    def _notes_schedule_save(self, event: Any = None) -> None:
+        if self._notes_save_after_id:
+            self.after_cancel(self._notes_save_after_id)
+        self._notes_save_after_id = self.after(800, self._notes_do_save)
+
+    def _notes_do_save(self) -> None:
+        self._notes_save_after_id = None
+        if self._notepad_expanded and hasattr(self, "_notes_textbox"):
+            try:
+                text = self._notes_textbox.get("1.0", "end-1c")
+                save_notes(text)
+            except Exception:
+                pass
+
+    def _save_notes_now(self) -> None:
+        if self._notes_save_after_id:
+            self.after_cancel(self._notes_save_after_id)
+            self._notes_save_after_id = None
+        if self._notepad_expanded and hasattr(self, "_notes_textbox"):
+            try:
+                text = self._notes_textbox.get("1.0", "end-1c")
+                save_notes(text)
+            except Exception:
+                pass
+
+    def _on_close(self) -> None:
+        self._save_notes_now()
+        self.destroy()
 
     def _refresh_list(self) -> None:
         for w in self.menu_frame.winfo_children():
@@ -338,7 +758,7 @@ class MainApp(ctk.CTk):
             return
         for i, p in enumerate(profiles):
             row = ctk.CTkFrame(self.menu_frame, fg_color=("gray85", "gray22"), corner_radius=8)
-            row.grid(row=i, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+            row.grid(row=i, column=0, columnspan=6, sticky="ew", padx=4, pady=4)
             row.grid_columnconfigure(1, weight=1)
             name = p.get("name", "—")
             host = p.get("host", "—")
@@ -354,33 +774,65 @@ class MainApp(ctk.CTk):
     def _rebuild_tabs(self) -> None:
         for w in self.tab_bar.winfo_children():
             w.destroy()
-        tabs_frame = ctk.CTkFrame(self.tab_bar, fg_color="transparent")
-        tabs_frame.pack(side="left", fill="y", padx=6, pady=6)
+        tab_row = ctk.CTkFrame(self.tab_bar, fg_color="transparent")
+        tab_row.pack(fill="x", expand=True, padx=6, pady=6)
+
+        tab_height = 28
+
         main_btn = ctk.CTkButton(
-            tabs_frame, text="Главное меню", width=120, height=28,
+            tab_row,
+            text="Главное меню",
+            width=120,
+            height=tab_height,
             fg_color=("#2b5278", "#2b5278") if self.current_tab == "main" else ("gray65", "gray35"),
             command=self._switch_to_main,
         )
         main_btn.pack(side="left", padx=2)
+
         for i, s in enumerate(self.sessions):
             title = s["profile"].get("name", "Сессия")
-            btn = ctk.CTkButton(
-                tabs_frame, text=title, width=120, height=28,
-                fg_color=("#2b5278", "#2b5278") if self.current_tab == i else ("gray65", "gray35"),
-                command=lambda idx=i: self._switch_to_session(idx),
-            )
-            btn.pack(side="left", padx=2)
-            s["tab_btn"] = btn
+            is_active = self.current_tab == i
+            tab_bg = ("#2b5278", "#2b5278") if is_active else ("gray65", "gray35")
+            tab_fg = ("gray90", "gray90")
+
+            tab_frame = ctk.CTkFrame(tab_row, fg_color=tab_bg, corner_radius=6, width=130, height=tab_height)
+            tab_frame.pack(side="left", padx=2)
+            tab_frame.pack_propagate(False)
+            tab_frame.grid_columnconfigure(1, weight=1)
+            tab_frame.grid_rowconfigure(0, weight=1)
+            tab_frame.bind("<Button-1>", lambda e, idx=i: self._switch_to_session(idx))
+
+            lbl = ctk.CTkLabel(tab_frame, text=title, text_color=tab_fg, anchor="w")
+            lbl.grid(row=0, column=0, sticky="w", padx=(10, 4), pady=0)
+            lbl.bind("<Button-1>", lambda e, idx=i: self._switch_to_session(idx))
+
+            close_lbl = ctk.CTkLabel(tab_frame, text=" ✕ ", text_color=tab_fg, cursor="hand2")
+            close_lbl.grid(row=0, column=1, sticky="e", padx=(0, 8), pady=0)
+
+            def _close_tab(e: Any, idx: int = i) -> str:
+                self._on_session_closed(idx)
+                return "break"
+
+            close_lbl.bind("<Button-1>", _close_tab)
+
+            s["tab_btn"] = tab_frame
 
     def _switch_to_main(self) -> None:
         self.current_tab = "main"
-        self.menu_frame.lift()
+        for s in self.sessions:
+            s["view"].grid_remove()
+        self.menu_frame.grid(row=0, column=0, sticky="nsew")
         self._rebuild_tabs()
 
     def _switch_to_session(self, index: int) -> None:
         if 0 <= index < len(self.sessions):
             self.current_tab = index
-            self.sessions[index]["view"].lift()
+            self.menu_frame.grid_remove()
+            for i, s in enumerate(self.sessions):
+                if i == index:
+                    s["view"].grid(row=0, column=0, sticky="nsew")
+                else:
+                    s["view"].grid_remove()
             self._rebuild_tabs()
 
     def _on_session_closed(self, index: int) -> None:
@@ -388,10 +840,13 @@ class MainApp(ctk.CTk):
             return
         was_current = self.current_tab == index
         s = self.sessions.pop(index)
+        s["view"].disconnect()
         s["view"].destroy()
         if was_current:
             self.current_tab = "main"
-            self.menu_frame.lift()
+            for v in self.sessions:
+                v["view"].grid_remove()
+            self.menu_frame.grid(row=0, column=0, sticky="nsew")
         elif isinstance(self.current_tab, int) and self.current_tab > index:
             self.current_tab -= 1
         self._rebuild_tabs()
@@ -453,13 +908,24 @@ class MainApp(ctk.CTk):
             return
         client, channel = result
 
-        view = SessionView(
-            self.content_holder,
-            profile,
-            client,
-            channel,
-            on_close=lambda: None,
-        )
+        try:
+            view = SessionView(
+                self.content_holder,
+                profile,
+                client,
+                channel,
+                on_close=lambda: None,
+            )
+        except Exception as e:
+            self._show_error("Ошибка терминала", str(e))
+            try:
+                channel.close()
+                client.close()
+            except Exception:
+                pass
+            return
+
+        self.menu_frame.grid_remove()
         view.grid(row=0, column=0, sticky="nsew")
 
         def close_cb() -> None:
