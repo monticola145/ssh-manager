@@ -326,6 +326,7 @@ class SessionView(ctk.CTkFrame):
         _setup_pyte_tags(self.text._textbox)
 
         self.text.bind("<Control-c>", self._on_ctrl_c)
+        self.text.bind("<Control-v>", self._on_ctrl_v)
         self.text._textbox.bind("<KeyPress>", self._on_terminal_key)
 
         self._output_queue: queue.Queue[bytes] = queue.Queue()
@@ -341,8 +342,27 @@ class SessionView(ctk.CTkFrame):
         self.after(self._flush_interval_ms, self._poll_pending_output)
 
     def _on_ctrl_c(self, event: Any = None) -> str:
+        try:
+            sel = self.text._textbox.get("sel.first", "sel.last")
+            if sel:
+                root = self.winfo_toplevel()
+                root.clipboard_clear()
+                root.clipboard_append(sel)
+                return "break"
+        except Exception:
+            pass
         if self.running:
             self._send(b"\x03")
+        return "break"
+
+    def _on_ctrl_v(self, event: Any = None) -> str:
+        try:
+            root = self.winfo_toplevel()
+            paste_text = root.clipboard_get()
+            if paste_text and self.running:
+                self._send(paste_text)
+        except Exception:
+            pass
         return "break"
 
     def _send_loop(self) -> None:
@@ -368,6 +388,17 @@ class SessionView(ctk.CTkFrame):
 
     def _on_terminal_key(self, event: Any) -> str:
         if not self.running:
+            return "break"
+        state = getattr(event, "state", 0)
+        keysym = getattr(event, "keysym", "")
+        if (state & 0x4) and keysym.lower() == "v":
+            try:
+                root = self.winfo_toplevel()
+                paste_text = root.clipboard_get()
+                if paste_text:
+                    self._send(paste_text)
+            except Exception:
+                pass
             return "break"
         data = _key_event_to_bytes(event)
         if data:
